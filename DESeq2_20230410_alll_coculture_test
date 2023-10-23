@@ -1,0 +1,417 @@
+##This script is created to analyze BHI_Tnseq data
+
+library(dplyr) ## to manipulate tables
+library(GenomicRanges)  ## to look at gene overlaps
+library(tidyverse)
+library(DESeq2)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(version = "3.16")
+BiocManager::install("apeglm")
+BiocManager::install("DESeq2")
+
+#Clear environment
+rm(list=ls())
+## define some files and locations
+# my mac does not mount the shared drive in a consistent location - annoying!
+# so I have first figure out where it is:
+sharedDriveLocation <- "/Volumes/fh/fast/malik_h/"
+if (!file.exists(sharedDriveLocation)) { sharedDriveLocation <- "/Volumes/malik_h/" }
+
+## change working dir
+workingDir <- paste(sharedDriveLocation, "/user/yhsieh/Raw_Sequence_Reads/Tnseq_20221226/usftp21.novogene.com/R_analysis/all_culture_test", sep="")
+setwd(workingDir)
+
+## specify where Phoebe's analysis files are
+inputFileDir <- paste(sharedDriveLocation, "", sep="/user/yhsieh/Raw_Sequence_Reads/Tnseq_20221226/usftp21.novogene.com/R_analysis/all_culture_test")
+sampleinfo <- read.csv("all_culture_test_DESeq2_design.csv", row.names =1)
+sampleinfo [,1] <- factor (sampleinfo [,1], levels = c("BHI", "Tyr", "Far", "BHIY1", "Mg", "MgY1"))
+
+load (file ="geneCoordsPlusCounts.rda")
+Counts <- geneCoordsPlusCounts %>% select(ends_with("numReads"))
+rownames(Counts) <- geneCoordsPlusCounts[,"Alias"]
+colnames(Counts) <- gsub( "_numReads", "", colnames(Counts))
+Counts <- Counts[, rownames(sampleinfo)]
+dds <- DESeqDataSetFromMatrix(countData = Counts,
+                              colData = sampleinfo,
+                              design= ~ Batch + Condition)
+dds <- DESeq(dds)
+
+resultsNames(dds)
+
+
+##output gene counts before DESeq, for comparison with the analysis done in 2021
+write.csv(Counts, file= "Mgcoculture_counts.csv")
+
+##Pre-filtering to remove genes with much fewer reads. I choose the lowest cut-off as 10 reads per gene, 350 reads for 12 samples in total. When doing per site analysis, I need to change the threshold for counts much lower (maybe 50)
+keep <- rowSums(counts(dds)) >= 350
+dds <- dds[keep, ]
+
+# log fold change shrinkage for visualization and ranking. I got error in the following line. Need to figure out how to install apeglm
+library("apeglm")
+resLFC <- lfcShrink(dds, coef="Condition_MgY1_vs_BHI", type= "apeglm")
+
+plotMA(resLFC, ylim=c(-2,2))
+plotMA(resLFC)
+
+##Specify the reference level (control). I use Condition of BHI as a control.After sepcify the control, I need to run DESeq again.
+dds$Condition <- relevel(dds$Condition, ref = "BHI")
+#dds <-DESeq(dds)
+#resultsNames(dds)
+
+##compare result between MgY1 and Mg
+res <- results(dds, contrast= c("Condition", "MgY1", "Mg"))
+summary(res)
+
+resFLT <- res[which(abs(res[, "log2FoldChange"]) >1& res[,"padj"] < 0.05),]
+resFLT
+summary(resFLT)
+write.csv(as.data.frame(resFLT),file= "DEgenes_MgY1_Mg_2FC_padj0.05_filter350_new.csv") 
+
+##Show results between BHIY1 and BHI
+res <- results(dds, name="Condition_BHIY1_vs_BHI")
+resultsNames(dds)
+summary(res)
+
+sum(res$padj < 0.05, na.rm=TRUE)
+
+# Filter result in res by log2FC(more than 2 fols or smaller than 0.5 fold) and p-value(padj<0.05) and rank the result
+#table(res[,"padj"] < 0.1) 
+#table(abs(res[, "log2FoldChange"]) >1)
+
+#table(res[,"padj"] < 0.1) 
+#table(abs(res[, "log2FoldChange"]) >1, res[,"padj"] < 0.1)
+#table(abs(res[, "log2FoldChange"]) >1& res[,"padj"] < 0.1)
+
+resFLT <- res[which(abs(res[, "log2FoldChange"]) >1& res[,"padj"] < 0.05),]
+resFLT
+write.csv(as.data.frame(resFLT),file= "DEgenes_EDTAMg_EDTA_2FC_padj0.05_filter350_re2.csv") 
+
+# Data quality assessment by sample culstering and visualization
+
+# make PCA plot
+vsd <- vst(dds, blind=FALSE)
+plotPCA(vsd, intgroup=c("Condition", "Batch"))
+#plotPCA(vsd[ ,4:9], intgroup=c("Condition", "Batch"))
+
+
+
+#plot counts of a specific gene across conditions
+plotCounts(dds, gene=which.min(res$padj), intgroup="Condition")
+
+plotCounts(dds, gene="PA4438", intgroup="Condition")
+
+# Make a Volcano plot between BHIY1 and BHI. The default cut-off for log2FC is >|2|; the default cut-off for P value is 10e-6
+if (!requireNamespace('BiocManager', quietly = TRUE))
+  install.packages('BiocManager')
+
+BiocManager::install('EnhancedVolcano')
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(res,
+                lab = rownames(res),
+                x = 'log2FoldChange',
+                y = 'pvalue', 
+                ylim =c(0,20), xlim = c(-10,25),
+                pCutoff = 0.05, pCutoffCol = 'padj',
+                pointSize= 2,
+                subtitle = paste0('p-value cutoff (black line) drawn ',
+                                  'at equivalent of adjusted p=0.05'),
+                title ='BHIY1 versus BHI')
+
+# 20211027 Make a customized volcano plot between BHIY1 and BHI that labels genes of interest based on fold change
+
+# create custom key-value pairs for 'high', 'low', 'mid' expression by fold-change
+# this can be achieved with nested ifelse statements
+keyvals <- ifelse(
+  res$log2FoldChange < -1 &res$padj<0.05, 'royalblue',
+  ifelse(res$log2FoldChange > 1 &res$padj
+         <0.05, 'gold',
+         'black'))
+keyvals[is.na(keyvals)] <- 'light gray'
+names(keyvals)[keyvals == 'red'] <- 'Tn mutants showing increased fitness'
+names(keyvals)[keyvals == 'light gray'] <- 'not significant'
+names(keyvals)[keyvals == 'royalblue'] <- 'Tn mutants showing decreased fitness'
+
+EnhancedVolcano(res,
+                lab = rownames(res),
+                x = 'log2FoldChange',
+                y = 'pvalue', 
+                #selectLab = rownames(res)[which(names(keyvals) %in% c('Tn mutants showing increased fitness', 'Tn mutants showing decreased fitness'))],
+                colCustom = keyvals,
+                colAlpha = 1.0,
+                ylim =c(0,180), xlim = c(-10,25),
+                pCutoff = 0.05, pCutoffCol = 'padj',
+                FCcutoff = 1.0,
+                pointSize= 2,
+                labSize = 0,
+                subtitle = paste0('p-value cutoff (black dotted line) drawn ',
+                                  'at equivalent of adjusted p=0.05'),
+                title ='Co-culture versus Monoculture in BHI')
+
+# this is for zoom-in plot based on the same plot in the above
+
+keyvals2 <- ifelse(
+  res$log2FoldChange < -1 &res$padj<0.05, 'royalblue',
+  ifelse(res$log2FoldChange > 1 &res$padj
+         <0.05, '#A60021',
+         '#E5E5E5'))
+keyvals2[is.na(keyvals2)] <- '#E5E5E5'
+names(keyvals2)[keyvals2 == '#A60021'] <- 'Tn mutants showing increased fitness'
+names(keyvals2)[keyvals2 == '#E5E5E5'] <- 'not significant'
+names(keyvals2)[keyvals2 == 'royalblue'] <- 'Tn mutants showing decreased fitness'
+
+p1 <- EnhancedVolcano(res,
+                      lab = rownames(res),
+                      x = 'log2FoldChange',
+                      y = 'pvalue',
+                      selectLab =c('PA4825','PA4824','PA4826', 'PA0966','PA4944','PA4451.1','PA4752','PA0763','PA3050','PA2876'),
+                      xlab = bquote(~Log[2]~ 'fold change'),
+                      ylim =c(0,180), xlim = c(-10,25),
+                      title = 'Co-culture versus Monoculture in BHI',
+                      pCutoff = 0.05, pCutoffCol = 'padj',
+                      FCcutoff = 1.0,
+                      pointSize = 4.5,
+                      labSize = 4.5,
+                      colCustom = keyvals2,
+                      colAlpha = 1,
+                      subtitle = paste0('p-value cutoff (black dotted line) drawn ',
+                                        'at equivalent of adjusted p=0.05'),
+                      #legendLabSize = 15,
+                      #legendPosition = 'left',
+                      legendIconSize = 5.0,
+                      drawConnectors = TRUE,
+                      widthConnectors = 0.5,
+                      colConnectors = 'grey50',
+                      gridlines.major = TRUE,
+                      gridlines.minor = FALSE,
+                      border = 'partial',
+                      borderWidth = 1.5,
+                      borderColour = 'black')
+p1
+
+#Make a customized volcano plot that labels genes of interest, ex: pyrimidine synthesis genes and magnesium transport genes with a specific shape
+
+# define different cell-types that will be shaded
+celltype1 <- c('PA3050','PA2876','PA5331','PA4758')
+celltype2 <- c('PA4825','PA4824','PA4826')
+
+# create custom key-value pairs for different cell-types
+# this can be achieved with nested ifelse statements
+keyvals.shape <- ifelse(
+  rownames(res) %in% celltype1, 17,
+  ifelse(rownames(res) %in% celltype2, 64,
+         20))
+keyvals.shape[is.na(keyvals.shape)] <- 20
+names(keyvals.shape)[keyvals.shape == 20] <- 'all other genes'
+names(keyvals.shape)[keyvals.shape == 17] <- 'pyrimidine synthesis'
+names(keyvals.shape)[keyvals.shape == 64] <- 'Mg2+ transporter'
+
+
+
+p1 <- EnhancedVolcano(res,
+                      lab = rownames(res),
+                      x = 'log2FoldChange',
+                      y = 'pvalue',
+                      selectLab = rownames(res)[which(names(keyvals.shape) %in% c('pyrimidine synthesis', 'Mg2+ transporter'))],
+                      xlab = bquote(~Log[2]~ 'fold change'),
+                      ylim =c(0,20), xlim = c(-10,10),
+                      title = 'Custom shape over-ride',
+                      pCutoff = 0.05,
+                      FCcutoff = 1.0,
+                      pointSize = 4.5,
+                      labSize = 4.5,
+                      shapeCustom = keyvals.shape,
+                      colCustom = NULL,
+                      colAlpha = 0.5,
+                      legendLabSize = 15,
+                      legendPosition = 'left',
+                      legendIconSize = 5.0,
+                      drawConnectors = TRUE,
+                      widthConnectors = 0.5,
+                      colConnectors = 'grey50',
+                      gridlines.major = TRUE,
+                      gridlines.minor = FALSE,
+                      border = 'partial',
+                      borderWidth = 1.5,
+                      borderColour = 'black')
+p1
+
+##20221122 make a heatmap to compare the difference of counts of genes across samples
+# Make a heatmap using ntd data
+library("pheatmap")
+pheatmap(assay(ntd), cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE)
+
+#take genes only varrying the most among these 12 samples to make a heatmap. for each row, we calculate std and we pick up genes with highest std as genes that vary the most
+sd_ntd <-apply(assay(ntd), 1, sd)
+mean_ntd <-apply(assay(ntd), 1, mean)
+plot(mean_ntd, sd_ntd)
+
+sd_vsd <-apply(assay(vsd), 1, sd)
+mean_vsd <-apply(assay(vsd), 1, mean)
+plot(mean_vsd, sd_vsd)
+
+# pick up genes that vary the most among specific samples
+sd5_vsd <- apply(assay(vsd)[,c("Tn2_BHI", "Tn3_BHI", "EDTA_Mg_1" , "EDTA_Mg_2" , "EDTA_Mg_3" , "Tn11_BHIY1" , "Tn12_BHIY1" )], 1, sd)
+
+sd_vsd [ order(sd_vsd,decreasing = TRUE)[1:10] ]
+
+# pick up the top 100 genes showing highest std
+top100_vsd <- assay(vsd) [ order(sd5_vsd,decreasing = TRUE)[1:100] ,]
+
+pheatmap(top100_vsd, cluster_rows=TRUE, show_rownames=FALSE,
+         cluster_cols=FALSE, scale = "row")
+
+
+## Make a heat map with Janet. The following script is to plot a heat map of a list of genes of interst. Use transformed data(normTransform, vst, rlog) to make plot. norTransform transforms data value through log2 and plus 1
+ntd <- normTransform(dds)
+
+# Set thresholds
+padj.cutoff <- 0.05
+lfc.cutoff <- 1
+threshold <- res$padj < padj.cutoff & abs(res$log2FoldChange) > lfc.cutoff
+
+# Keep only the significantly differentiated genes where the fold-change was at least 1. ntdSelect is a dataframe that stores transformed data value of a list of genes of interest(sigGenes) across 12 samples.
+sigGenes <- rownames(res[threshold,])
+ntdSelect <- assay(ntd)[rownames(assay(ntd)) %in% sigGenes, ]
+
+# Make a heatmap
+library("pheatmap")
+# Annotate column and cluster the rows (genes)
+df <- as.data.frame(colData(dds)[,c("Condition","Batch")])
+pheatmap(ntdSelect, cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df)
+
+# scale is to normalize the transformed value of each gene to its mean across all 12 samples
+pheatmap(ntdSelect, cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, scale="row")
+
+# only plot a heatmap from column1 to column6 (BHI_Y1 and BHI samples)
+pheatmap(ntdSelect[,1:6], cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, scale="row")
+
+# Make a heatmap of a list of genes of interest (Log2FC>1 and padj<0.05) between BHIY1 and BHI (what do transformed values in vst mean?)
+
+deseq2VST <- vst(dds, blind=FALSE)
+# Convert the DESeq transformed object to a data frame
+deseq2VST <- assay(deseq2VST)
+
+deseq2VST <- deseq2VST[rownames(deseq2VST) %in% sigGenes, ]
+
+pheatmap(deseq2VST, cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, scale="row")
+
+
+# Transform data with rlog to make heat map
+
+deseq2RLD <- rlog(dds, blind=FALSE)
+# Convert the DESeq transformed object to a data frame
+deseq2RLD <- assay(deseq2RLD)
+
+deseq2RLD <- deseq2RLD[rownames(deseq2RLD) %in% sigGenes, ]
+
+pheatmap(deseq2RLD, cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df, scale="row")
+
+# Another way of making heatmap with Ching-Ho. But I am not sure what the values in this plot mean 
+#Convert the VST counts to long format for ggplot2
+library(reshape2)
+# Now overwrite our original data frame with the long format
+deseq2VST <- melt(deseq2VST, id.vars=c("Gene"))
+
+a<-subset(deseq2VST, deseq2VST$variable=='Tn3_BHI' | deseq2VST$variable=='Tn2_BHI' | deseq2VST$variable=='Tn1_BHI'| deseq2VST$variable=='Tn10_BHIY1'| deseq2VST$variable=='Tn11_BHIY1'| deseq2VST$variable=='Tn12_BHIY1')
+
+ggplot(a,aes(Gene,variable))+geom_tile(aes(fill=value) )
+
+
+##Compare BHIFar and BHI, BHITyr with BHI
+resultsNames(dds)
+
+#Get result of comparing BHIFar with BHI
+res2 <- results(dds, name="Condition_BHIFar_vs_BHI")
+summary(res2)
+sum(res2$padj < 0.1, na.rm=TRUE)
+res2FLT <- res2[which(abs(res2[, "log2FoldChange"]) >1& res2[,"padj"] < 0.05),]
+res2FLT
+
+plotCounts(dds, gene="PA0763", intgroup="Condition")
+
+EnhancedVolcano(res2,
+                lab = rownames(res2),
+                x = 'log2FoldChange',
+                y = 'pvalue', 
+                ylim =c(0,20), xlim = c(-10,25),
+                pCutoff = 0.05, pCutoffCol = 'padj',
+                pointSize= 2,
+                subtitle = paste0('p-value cutoff (black line) drawn ',
+                                  'at equivalent of adjusted p=0.05'),
+                title ='BHIFar versus BHI')
+
+#Get result of comparing BHITyr with BHI
+res3 <- results(dds, name="Condition_BHITyr_vs_BHI")
+summary(res3)
+sum(res3$padj < 0.1, na.rm=TRUE)
+res3FLT <- res3[which(abs(res3[, "log2FoldChange"]) >1& res3[,"padj"] < 0.05),]
+res3FLT
+
+EnhancedVolcano(res3,
+                lab = rownames(res3),
+                x = 'log2FoldChange',
+                y = 'pvalue', 
+                selectLab = ('PA0763'),
+                ylim =c(0,20), xlim = c(-10,25),
+                pCutoffCol = 'padj',
+                pCutoff = 0.05,
+                FCcutoff = 2,
+                pointSize= 2,
+                subtitle = paste0('p-value cutoff (black line) drawn ',
+                                  'at equivalent of adjusted p=0.05'),
+                title ='BHITyr versus BHI')
+
+
+#Get result of comparing Batch_original_vs_amplified
+res4 <- results(dds, name="Batch_original_vs_amplified")
+summary(res4)
+sum(res4$padj < 0.1, na.rm=TRUE)
+res4FLT <- res4[which(abs(res4[, "log2FoldChange"]) >1& res4[,"padj"] < 0.05),]
+res4FLT
+
+EnhancedVolcano(res4,
+                lab = rownames(res4),
+                x = 'log2FoldChange',
+                y = 'pvalue', 
+                selectLab = ('PA0763'),
+                ylim =c(0,3), xlim = c(-10,10),
+                pCutoffCol = 'padj',
+                pCutoff = 0.05,
+                FCcutoff = 2,
+                pointSize= 2,
+                subtitle = paste0('p-value cutoff (black line) drawn ',
+                                  'at equivalent of adjusted p=0.05'),
+                title ='Batch_original_vs_amplified')
+
+
+
+## with Janet, QC the counts of single candidate genes
+pdf("dotplots_DEgenes_BHIY1_BHI.pdf", width = 7, height = 11)
+par(mfrow=c(3, 3))
+for (tempgene in rownames(resFLT)) { 
+  plotCounts(dds, gene=tempgene, intgroup="Condition")
+  
+}
+dev.off()
+
+pdf("dotplots_DEgenes_BHIY1_BHI_rawcounts.pdf", width = 7, height = 11)
+par(mfrow=c(3, 3))
+for (tempgene in rownames(resFLT)) { 
+  plotCounts(dds, gene=tempgene, intgroup="Condition", normalized = FALSE, transform = FALSE)
+  
+}
+dev.off()
+
+plotCounts(dds, gene="PA0763", intgroup="Condition", normalized = FALSE, transform = FALSE, ylim =c(0,30))
+
+
+##
